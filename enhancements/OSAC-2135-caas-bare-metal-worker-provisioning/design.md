@@ -3,7 +3,7 @@ title: caas-bare-metal-worker-provisioning
 authors:
   - rpiccoli@redhat.com
 creation-date: 2026-08-06
-last-updated: 2026-10-14
+last-updated: 2026-11-10
 tracking-link:
   - https://redhat.atlassian.net/browse/OSAC-2135
 prd:
@@ -35,7 +35,7 @@ The new approach eliminates the pool by provisioning workers on-demand. When a C
 ### Goals
 
 - Implement bare-metal worker management as a dedicated controller (`BareMetalWorkerReconciler`) within osac-operator, keeping the ClusterOrder controller generic and extensible for future VM worker support.
-- Keep all CaaS-managed bare-metal infrastructure (BMIs, InfraEnvs, Agents) invisible to tenant-facing APIs and UIs.
+- Keep InfraEnvs and Agents private, while exposing worker BMIs in the owning tenant's scope with provenance to the Cluster; cluster capacity remains managed through the Cluster API.
 - Support both initial provisioning and manual scale-up/scale-down through the same controller logic.
 - Ensure host cleanup on scale-down and cluster deletion flows through BMaaS's existing deprovision pipeline via `BareMetalInstances.Delete`.
 - Remove the BareMetalPool-based static pre-boot pool workflow entirely — no coexistence period.
@@ -56,7 +56,7 @@ A new `BareMetalWorkerReconciler` in osac-operator watches `ClusterOrder` CRs fo
 
 1. Creates a cluster-specific `InfraEnv` CR on the hub cluster to generate discovery ignition.
 2. Fetches discovery ignition from the InfraEnv and creates `BareMetalInstance` objects with the ignition passed inline as `user_data`, referencing the RHCOS DiskImage.
-3. Correlates registered Agents to BMIs via MAC address and labels them for NodePool selection.
+3. Correlates registered Agents to BMIs and applies the networking-aware binding gate before approving, binding, or labeling them for NodePool selection.
 
 No new CRDs are introduced. The design extends the ClusterOrder CRD status with a `workers` field to track CaaS-managed worker resources. BareMetalInstances created by CaaS belong to the cluster's tenant (see Worker Tenancy and Ownership) — the controller resolves the authoritative tenant from the fulfillment-service Cluster on every reconciliation and fails closed on any mismatch.
 
@@ -199,16 +199,17 @@ sequenceDiagram
 
     BMW->>BMW: Create InfraEnv CR (late binding, no clusterRef)
     AS-->>BMW: InfraEnv ready (discovery ignition available)
+    BMW->>BMW: Wait for HostedCluster and ManagementPublicationReady=True before worker Create
 
     loop For each requested bare-metal worker
         BMW->>BMaaS: Create BareMetalInstance (qcow2 + ignition)
-        BMaaS-->>BMW: BMI provisioned, MAC in status
+        BMaaS-->>BMW: BMI network-ready evidence and selected-port lease in status
     end
 
     loop Agent registration
         AS-->>BMW: Agent registered (MAC in inventory)
-        BMW->>BMW: Correlate Agent to BMI via MAC
-        BMW->>AS: Label Agent for NodePool
+        BMW->>BMW: Unique correlation plus BMI Ready and management; DNS/selected-port lease only when networking enabled
+        BMW->>AS: Only after gate passes: approve, bind and label for NodePool
     end
 
     HCP-->>BMW: Workers joined, NodePool scaled
@@ -234,11 +235,11 @@ The diagram shows the end-to-end provisioning flow. The controller waits for eac
    | `network_attachments` | `networkAttachment` + stored node-request `fabricInterface` | The sole attachment from `ClusterNetworkAttachment`; the stored interface was selected from the first `fabric` port during cluster creation, with `primary: true` (see Network Attachment Enrichment); BMaaS rejects additional entries |
    | `tenant` | The cluster's tenant, resolved authoritatively from the fulfillment-service Cluster | Ownership and audit; the controller fails closed on any ClusterOrder/Cluster tenant mismatch (see Worker Tenancy and Ownership) |
 
-   BMaaS handles the physical networking — moving the host to the tenant subnet VLAN and assigning an IP via fabric DHCP — as part of BMI provisioning (dependency: OSAC-1437). If the host fails to join the tenant network, the agent will not register on the expected subnet, and the existing `AgentRegistrationTimeout` handles this failure mode. API and ingress VIPs are provisioned by the existing AAP template (MetalLB LoadBalancer Services) and are not managed by this controller.
+   BMaaS owns the physical attachment, handoff power cycle, and lease discovery (dependency: OSAC-1437). Before handoff CaaS waits; after handoff, the registration deadline detects an Agent that never proves the worker network (see MAC Address Correlation). OSAC-1436 owns endpoint publication: provider management MetalLB supplies the hosted API VIP, OSAC allocates the guest ingress address, and a separate guest endpoint job configures guest MetalLB. The core install job creates the HostedCluster and NodePools, not guest MetalLB. This worker controller manages none of those endpoint allocations or public DNS records.
 5. The controller updates ClusterOrder status with the BMI references in `workers[]`. Each worker slot is first **reserved** in `status.workers[]` with an opaque generated name (see ClusterOrder CRD Status Extensions), and the BMI identity is persisted as part of the slot's record — the status journal is the durable source of truth for worker identity, so a crash or lost response can never produce an untracked BMI.
 6. BMaaS allocates a host, provisions it with the DiskImage and discovery ignition, and boots it. The host registers as an Agent with assisted-service.
-7. The controller watches Agent CRs in the cluster namespace. When a new Agent appears, the controller matches its inventory MAC addresses against the BMI's host NIC MACs (`status.hardware.nics[].mac`, OSAC-4203).
-8. Once correlated (a unique unbound Agent matching exactly one waiting worker, in both directions), the controller sets the Agent's `clusterDeploymentName`, marks it `approved: true`, and applies the `agentBareMetal` role label plus `osac.openshift.io/worker-name`, `osac.openshift.io/node-set`, `osac.openshift.io/instance-type`, and cluster-order labels so the NodePool's `agentLabelSelector` selects it. Late binding (explicit `clusterDeploymentName` setting) gives the controller full control over the Agent lifecycle — on scale-down, CAPA clears `clusterDeploymentName`, triggering the unbind flow that CaaS reacts to. A binding already rewritten by HyperShift's CAP-Agent handoff for the same worker is left untouched. The osac-operator's RBAC must include `get`, `list`, `watch`, `patch`, and `delete` on `agents` in the `agent-install.openshift.io` API group (see RBAC / Tenancy).
+7. The controller watches Agent CRs in the cluster namespace. Initial correlation is unique in both directions. With provider networking enabled it uses the selected NetworkAttachment port's MAC and accepted BMI IPv4 lease, not any NIC's MAC or the provisioning-network address; with networking disabled it uses the scoped host-NIC MAC fallback (see MAC Address Correlation).
+8. Only after correlation and the binding gate pass (BMI phase `Ready`, `ManagementPublicationReady=True`, and, with provider networking enabled, published API records and selected-MAC/lease proof), the controller sets the Agent's `clusterDeploymentName`, marks it `approved: true`, and applies the `agentBareMetal` role label plus `osac.openshift.io/worker-name`, `osac.openshift.io/node-set`, `osac.openshift.io/instance-type`, and cluster-order labels for NodePool selection. On scale-down CAPA clears `clusterDeploymentName`, triggering cleanup. A binding already rewritten by HyperShift's CAP-Agent handoff for the same worker is left untouched. The osac-operator's RBAC includes `get`, `list`, `watch`, `patch`, and `delete` on `agents` in the `agent-install.openshift.io` API group (see RBAC / Tenancy).
 9. HyperShift installs the Agent as a worker node. The controller converges NodePool `.spec.replicas` to the requested per-node-set capacity so provisioning Agents are not orphaned by premature scale-down.
 
 #### Scale-Up
@@ -247,7 +248,7 @@ A Tenant User increases `node_sets[].size` for a bare-metal node set. The fulfil
 
 **Step-by-step:**
 
-1. The controller computes `desired - current` where `current` is `status.currentWorkers` (workers in active phases: `Provisioning`, `WaitingForAgent`, `Binding`, `Ready`). Workers in `Failed` phase do not count toward capacity — new workers are created to fill the gap once their retry backoff expires.
+1. The controller reports `desired - current` using `status.currentWorkers` (verified identity-backed workers in active phases: `Provisioning`, `WaitingForAgent`, `Binding`, `Ready`), but does not use this reporting gap alone to authorize Create. Identity-less reservations, failed slots awaiting retry and retiring incarnations retain their slot obligations. Reuse a retained slot only after its old BMI is authoritatively absent, old-Agent cleanup is complete and any retry backoff expires; reserve a new slot only for desired capacity not already covered by a retained obligation. A pending cleanup must never be bypassed by allocating a different slot for the same missing worker.
 2. The controller re-reads the InfraEnv's `status.bootArtifacts.discoveryIgnitionURL` to fetch fresh ignition. The InfraEnv persists from initial provisioning; if it was deleted (e.g., manual cleanup), the InfraEnv observation stage recreates it on authoritative absence. The controller records the InfraEnv's UID on the ClusterOrder; if the InfraEnv is deleted and recreated while hosts are in `WaitingForAgent` phase (already booted with old ignition), the UID change marks those hosts `Failed` with `AgentRegistrationTimeout` so they enter the retry pipeline and are reprovisioned with fresh ignition.
 3. The controller resolves the RHCOS DiskImage from the cluster's current ClusterVersion's `disk_image` reference (see RHCOS DiskImage Resolution).
 4. For each new worker, the controller follows provisioning steps 4-9 from the initial flow (the ignition content is re-fetched in step 2 above).
@@ -270,11 +271,12 @@ sequenceDiagram
     HCP->>AS: AgentMachine unbinds Agent
     AS-->>BMW: Agent enters unbinding-pending-user-action
 
-    BMW->>BMW: Match Agent to BMI via MAC
+    BMW->>BMW: Find established worker-name association (scoped fallback only if unlabelled)
     BMW->>AS: Delete Agent CR
+    BMW->>BMW: Confirm old Agent UID absent
     BMW->>BMaaS: Delete BareMetalInstance
     BMaaS->>BMaaS: Host cleanup
-    BMW->>BMW: Remove worker from status.workers (after BMI deletion confirmed)
+    BMW->>BMW: Retain identity on dependency rejection; remove slot only after authoritative BMI Get NotFound
 ```
 
 This diagram shows the scale-down flow. CAPI handles node drain and agent unbinding automatically. The controller reacts to the agent reaching an unbound state and then cleans up the BMI.
@@ -287,12 +289,12 @@ This diagram shows the scale-down flow. CAPI handles node drain and agent unbind
 4. CAPI drains each selected node, then the AgentMachine controller unbinds the Agent (clears `ClusterDeploymentName`). With the assisted image service disabled (see Assisted Image Service), reclaim is not attempted and the Agent transitions directly to `unbinding-pending-user-action`. CAPA removes its hook/finalizer at this point.
 5. The controller watches for Agents entering `unbinding-pending-user-action` (or already `known-unbound`) and matches them back to their worker via the `osac.openshift.io/worker-name` label, falling back to a scoped MAC match against the recorded BMI's NICs for unlabelled Agents.
 6. The controller deletes the Agent CR with UID/resourceVersion preconditions. CAPA does not delete the Agent — it only clears `ClusterDeploymentName` and removes its own hook/finalizer. CaaS owns the Agent CR cleanup because the host will be deprovisioned by BMaaS. The controller waits for the Agent to be gone before requesting BMI deletion.
-7. The controller calls `BareMetalInstances.Delete` on the private API. BMaaS handles full host cleanup before returning the host to inventory. CaaS does not independently verify cleanup completion — this is a trust boundary between CaaS and BMaaS. If BMaaS cleanup fails, the host must not be reallocated; this guarantee is BMaaS's responsibility. A deleting BMI (deletion timestamp or `Deleting` state) means wait: only an authoritative `Get` returning `NotFound` releases the recorded identity.
+7. The controller calls `BareMetalInstances.Delete` on the private API. A manual ExternalIPAttachment or a FabricDomain referencing the assigned host blocks deletion with `FAILED_PRECONDITION` ([BMaaS Delete](/enhancements/OSAC-1437-bmaas-networking/design.md#delete)); the worker remains pending with its identity and finalizer until the dependency is removed and Delete can be retried. BMaaS/BMF owns power-off, NetworkAttachment offboarding, backend cleaning, and host release; CaaS neither bypasses those steps nor independently proves physical cleanup. A successful Delete, DELETING state, cache miss, List omission, or failed lookup is not absence: only an authoritative `Get` returning `NotFound` releases the recorded BMI identity.
 8. The controller retains the worker entry in `status.workers` in `Deleting` phase until the BMI deletion is confirmed. This prevents orphaned hosts — if `Delete` succeeds but cleanup stalls, the controller still has the reference to retry or alert. NodePool replicas converge to the reduced requested capacity.
 
 #### Cluster Deletion
 
-On ClusterOrder deletion, deleting the HostedCluster cascades through HyperShift (deletes all NodePools) → CAPI (drains nodes, deletes Machines) → CAPA (unbinds Agents), which cleans up the Kubernetes-side objects and the Agent CRs. The cascade does **not** delete the BMIs — the fulfillment-service BareMetalInstances are unknown to HyperShift. The `BareMetalWorkerReconciler`'s finalizer (`osac.openshift.io/baremetalworker-finalizer`) therefore actively deletes every BMI listed in `status.workers[]` via `BareMetalInstances.Delete`, rather than reacting to per-Agent unbind events as the scale-down flow does. The finalizer holds until all `status.workers[]` entries are confirmed deleted (authoritative `Get` → `NotFound`), including recovery of ID-less reservations by owned name. The InfraEnv CR and pull-secret Secret are garbage collected via their ownerReferences to the ClusterOrder.
+On ClusterOrder deletion, deleting the HostedCluster cascades through HyperShift (deletes all NodePools) → CAPI (drains nodes, deletes Machines) → CAPA (unbinds Agents). CaaS deletes the old Agent CRs; CAPA unbinding does not itself delete them. The cascade does **not** delete the BMIs — the fulfillment-service BareMetalInstances are unknown to HyperShift. The `BareMetalWorkerReconciler`'s finalizer (`osac.openshift.io/baremetalworker-finalizer`) therefore actively cleans every recorded Agent incarnation and requests every BMI's deletion, including recovery of ID-less reservations by owned name. Dependency-blocked or uncertain deletion retains the slot, identity, and finalizer; no replacement is created during cluster teardown. The finalizer holds until Agents are gone and authoritative BMI `Get` calls return `NotFound`. BMF owns physical cleanup. The InfraEnv CR and pull-secret Secret are garbage collected via their ownerReferences to the ClusterOrder.
 
 ### API Extensions
 
@@ -306,12 +308,13 @@ On ClusterOrder deletion, deleting the HostedCluster cascades through HyperShift
 
 **Modified behavior of existing resources:**
 
-- `BareMetalInstance` (fulfillment-service): CaaS-created BMIs belong to the cluster's tenant (see Worker Tenancy and Ownership). No changes to the public API are required for creation — the worker controller uses the private API and validates ownership on every read-back (tenant, name, `osac.openshift.io/owner-reference` annotation, and `osac.openshift.io/cluster-order` label must all match the ClusterOrder).
+- `BareMetalInstance` (fulfillment-service): CaaS-created BMIs belong to the cluster's tenant (see Worker Tenancy and Ownership). No changes to the public API are required for creation — the worker controller uses the private API and validates ownership on every read-back (tenant, name, owner-reference annotation, cluster-order label and server-owned `cluster-api-id` marker must match the authoritative Cluster/ClusterOrder ownership).
 
 **Tenant-visible status:** The PRD requires tenant-visible failure conditions. ClusterOrder conditions (`WorkersFailed`, `InfraEnvReady`, `RHCOSImageNotFound`) live on the hub cluster, which tenants cannot access. The existing feedback controller syncs ClusterOrder status to the public Cluster API via the `Signal` RPC. This design extends the feedback controller to translate worker conditions into the tenant-visible Cluster status:
 
 - `WorkersFailed=True` on ClusterOrder → `WORKER_PROVISIONING_FAILED` condition on the public Cluster, with a tenant-safe message (e.g., "2 of 5 worker nodes failed to provision") that omits infrastructure details (no BMI names, MACs, or backend errors)
-- Workers in `Failed` with high attempt count → Cluster condition message includes the attempt count and next retry time, so tenants know retries are ongoing
+- Networking failures (`NetworkAttachmentFailed`, `NetworkHandoffFailed`, `IPDiscoveryFailed`) → the worker failure condition uses the fixed tenant message `worker network attachment failed`; attempt counts, retry times, identities, and backend diagnostics remain on the hub for these failures
+- Other workers in `Failed` with high attempt count → Cluster condition message includes the attempt count and next retry time, so tenants know retries are ongoing
 - All other conditions (`InfraEnvReady=False`, `RHCOSImageNotFound`) → mapped to a generic `WORKER_PROVISIONING_BLOCKED` condition on the Cluster, indicating the cluster cannot provision workers due to an infrastructure issue requiring Cloud Infrastructure Admin intervention
 
 This ensures tenants see provisioning progress and actionable failure messages without exposure to CaaS internals. The condition names and feedback controller extension must align with [OSAC-1604](https://redhat.atlassian.net/browse/OSAC-1604) (status reporting improvements) to avoid overlap — this design defines CaaS-specific worker conditions, while OSAC-1604 defines the general status reporting framework. Coordination tracked via Jira link.
@@ -347,6 +350,8 @@ The following `osac-installer`/AAP config-as-code values are affected:
 
 #### ClusterOrder CRD Status Extensions
 
+The desired worker journal additionally records the associated Agent name and UID as `agent`, scoped to the cluster namespace. This is a proposed status extension for restart-safe incarnation tracking, not a claim about an existing field. Persist and confirm this association before Agent approval, binding or label side effects; retain it through cleanup. A pruned or conflicting status write authorizes no action. Missing legacy evidence must be recovered authoritatively before mutation, never guessed from a reused name.
+
 ```go
 type ClusterOrderStatus struct {
     // ... existing fields ...
@@ -377,6 +382,11 @@ type BareMetalInstanceReference struct {
     ID string `json:"id,omitempty"`
 }
 
+type WorkerAgentReference struct {
+    Name string `json:"name"`
+    UID string `json:"uid"`
+}
+
 const (
     WorkerBMICreateStateReserved  = "Reserved"
     WorkerBMICreateStateAttempted = "Attempted"
@@ -402,6 +412,7 @@ type WorkerStatus struct {
     // BareMetalInstance records the reserved name and fulfillment ID of the backing BMI.
     // +kubebuilder:validation:Optional
     BareMetalInstance BareMetalInstanceReference `json:"bareMetalInstance,omitempty"`
+    Agent *WorkerAgentReference `json:"agent,omitempty"`
     // BMICreateState distinguishes a never-attempted reservation (Reserved) from a
     // BMI Create that may have reached fulfillment (Attempted, persisted with
     // optimistic locking before calling Create and retained on unknown outcomes).
@@ -417,9 +428,9 @@ type WorkerStatus struct {
     CreationTimestamp metav1.Time `json:"creationTimestamp"`
     // AttemptCount tracks how many times this worker slot has been provisioned.
     AttemptCount int32 `json:"attemptCount"`
-    // AttemptStartedAt is the durable start of the current provisioning attempt;
-    // the agent registration timeout is measured from it, not from the parent
-    // ClusterOrder or an unrelated failure timestamp.
+    // AttemptStartedAt is the durable start of the current provisioning attempt
+    // for accounting; the networking-aware registration clock is reconstructed
+    // from BMI network readiness and ClusterOrder publication evidence.
     // +kubebuilder:validation:Optional
     AttemptStartedAt *metav1.Time `json:"attemptStartedAt,omitempty"`
     // LastFailureReason is a machine-readable reason for the last failure
@@ -469,6 +480,9 @@ status:
       bareMetalInstance:
         name: 4f9d2b1e-3c7a-4a55-9d0e-8b1f2a3c4d5e
         id: "uuid-0"
+      agent:
+        name: agent-0
+        uid: "agent-uid-0"
       bmiCreateState: Attempted
       phase: Ready
       creationTimestamp: "2026-08-10T13:00:00Z"
@@ -481,6 +495,9 @@ status:
       bareMetalInstance:
         name: 7c2e9f4a-1b3d-4e88-9a6f-0d5c7b8e2a1f
         id: "uuid-1"
+      agent:
+        name: agent-1
+        uid: "agent-uid-1"
       bmiCreateState: Attempted
       phase: Ready
       creationTimestamp: "2026-08-10T13:00:00Z"
@@ -496,9 +513,8 @@ status:
       phase: Failed
       creationTimestamp: "2026-08-10T13:00:00Z"
       attemptCount: 2
-      attemptStartedAt: "2026-08-10T14:00:00Z"
       lastFailureReason: AgentRegistrationTimeout
-      lastFailureMessage: "no agent registered within 30m0s"
+      lastFailureMessage: "no Agent passed the binding gate by the reconstructed registration deadline"
       lastFailureTime: "2026-08-10T14:30:00Z"
       nextRetryTime: "2026-08-10T15:00:00Z"
     - nodeSet: gpu
@@ -508,6 +524,9 @@ status:
       bareMetalInstance:
         name: d4e5f6a7-b8c9-4d0e-8f1a-2b3c4d5e6f7a
         id: "uuid-3"
+      agent:
+        name: agent-3
+        uid: "agent-uid-3"
       bmiCreateState: Attempted
       phase: Ready
       creationTimestamp: "2026-08-10T13:05:00Z"
@@ -523,7 +542,6 @@ status:
       phase: Failed
       creationTimestamp: "2026-08-10T13:05:00Z"
       attemptCount: 3
-      attemptStartedAt: "2026-08-10T13:55:00Z"
       lastFailureReason: ResourceExhausted
       lastFailureMessage: "Host allocation failed: no available hosts"
       lastFailureTime: "2026-08-10T14:25:00Z"
@@ -532,19 +550,22 @@ status:
 
 The `workers[]` list always contains all worker references regardless of their individual state. The `WorkersFailed` condition provides the aggregate summary. The ClusterOrder remains in `Progressing` phase (not `Failed`) because 3 workers are operational. Per-worker detail (which slot failed, why, when the next retry is) is visible directly in the status.
 
-The controller tracks worker lifecycle through phases: `Provisioning` → `WaitingForAgent` → `Binding` → `Ready` (and `Unbinding` → `Deleting` for scale-down). `Provisioning` is the reservation period before the BMI exists; the phase moves to `WaitingForAgent` once the BMI identity is recorded. `Failed` is reachable only from provisioning phases (`Provisioning`, `WaitingForAgent`, `Binding`) and triggers automatic retry. Teardown issues (e.g., agent unbinding timeout, BMI deletion failure) keep the worker in `Unbinding` or `Deleting` with error details in `lastFailureReason` — they do not transition to `Failed` and do not trigger replacement, since the intent is removal, not reprovisioning.
+The controller tracks worker lifecycle through phases: `Provisioning` → `WaitingForAgent` → `Binding` → `Ready` (and `Unbinding` → `Deleting` for teardown). `Provisioning` is the reservation period before the BMI exists; the phase moves to `WaitingForAgent` once the BMI identity is recorded. `Failed` is reachable only from provisioning phases (`Provisioning`, `WaitingForAgent`, `Binding`) and triggers automatic retry. Teardown issues (e.g., agent unbinding timeout, BMI deletion failure) keep the worker in `Unbinding` or `Deleting` with error details in `lastFailureReason`; they do not transition to `Failed` or authorize replacement before cleanup. After confirmed cleanup, scale-down or Cluster deletion removes the slot; a tenant-deleted Ready BMI instead follows the replacement rule below if Cluster capacity is still requested.
 
 **Retry behavior:** The API is declarative — the controller retries indefinitely until the desired state is reached. There is no `PermanentlyFailed` state. When a worker enters `Failed`, the controller first cleans the failed incarnation (the old Agent must be gone and the BMI must be authoritatively absent — a successful `Delete` alone is pending, not completion), then initializes a single retry checkpoint (`nextRetryTime`, `bmiCreateState: Reserved`, cleared `attemptStartedAt`) and creates a replacement when the retry is due, with escalating backoff classified by `lastFailureReason`:
 
 | Failure type | Examples (`lastFailureReason`) | Backoff | Rationale |
 |---|---|---|---|
-| Transient infrastructure | BMaaS API timeout, backend provisioning error (default category) | Short exponential: 30s, 60s, 120s, capped at 5m | Likely to resolve quickly; fresh host allocation may succeed immediately |
+| Transient infrastructure | Definite backend provisioning error (default category); unknown Create outcomes use identity recovery, not failure classification | Short exponential: 30s, 60s, 120s, capped at 5m | Likely to resolve quickly; fresh host allocation may succeed after confirmed cleanup |
 | Resource availability | `NoHostAvailable`, `ResourceExhausted` | Long exponential: 5m, 15m, 30m, capped at 30m | Inventory needs time to free up; aggressive retry wastes API calls |
 | Agent registration timeout | `AgentRegistrationTimeout` | Long exponential: 5m, 15m, 30m, capped at 30m | Root cause (bad image URL, broken InfraEnv, network) is unlikely to self-resolve; gives operator time to investigate before next attempt burns another host |
+| Worker networking | `NetworkAttachmentFailed`, `NetworkHandoffFailed`, `IPDiscoveryFailed` | Long exponential: 5m, 15m, 30m, capped at 30m | Preserve the BMI's stable reason; repair the network before consuming another host |
 
 The `attemptCount` is persisted in `WorkerStatus` and survives controller restarts. After the initial escalation period (first 3 attempts), the backoff caps at the maximum for that failure type and the controller continues retrying at that interval. If a replacement succeeds and stays `Ready` for 1 hour (`MinHealthyDuration`), the `attemptCount` resets to 0 — distinguishing a resolved transient issue from a recurring problem.
 
 The `WorkersFailed` condition reports which slots are retrying (with attempt number and next retry time), so operators are alerted and can investigate. For persistent misconfigurations (wrong DiskImage, broken network), the capped backoff ensures the controller does not burn hosts aggressively while still converging once the root cause is fixed.
+
+The ClusterOrder controller separately derives `WorkerNetworkingReady` from the hub BMI CRs and Cluster SecurityGroups as [OSAC-1436 defines](/enhancements/OSAC-1436-caas-networking/design.md#worker-bmis). A networking-failed worker preserves its stable reason through cleanup/backoff until a replacement BMI is Ready; a failed automatic or selected SecurityGroup also yields `WorkerNetworkingFailed`. With provider networking enabled, failure takes precedence: only without either failure does pending BMI evidence yield `WorkersProgressing` or every requested worker BMI Ready yield `WorkersReady` (including zero workers). Provider-disabled networking yields True with `ProvisioningDisabled`. Tenant networking messages are fixed: `Worker networking is in progress.` or `Worker networking did not complete.`; the worker failure condition uses `worker network attachment failed`. BMI identities, backend diagnostics, and retry history remain on the hub, with Warning event `WorkerNetworkingFailed`.
 
 **Scale-down priority:** When the tenant scales down, the controller removes workers by CAPI-aligned deletion priority — `Failed` first (no running node, no bound agent, only a dead BMI to clean up), then not-yet-bound workers, then the newest `Ready` workers. Retention therefore prefers healthy, older workers.
 
@@ -570,7 +591,7 @@ spec:
   sshAuthorizedKey: <from spec.sshPublicKey, falling back to the ssh_public_key template parameter>
 ```
 
-The InfraEnv uses **late binding** — no `clusterRef`. Agents register as unbound and the controller explicitly binds them by setting `clusterDeploymentName` after MAC correlation. This gives the controller full control over the Agent binding lifecycle: on scale-down, CAPA clears `clusterDeploymentName`, the Agent enters `unbinding-pending-user-action`, and the controller reacts by deleting the Agent CR and then the BMI. CAPI handles node drain and Node object deletion independently — the pre-terminate hook clears as soon as the Agent reaches `unbinding-pending-user-action`, so node removal does not depend on the host rebooting into discovery.
+The InfraEnv uses **late binding** — no `clusterRef`. Agents register as unbound and the controller explicitly binds them by setting `clusterDeploymentName` only after unique correlation and the networking-aware gate. This gives the controller full control over the Agent binding lifecycle: on scale-down, CAPA clears `clusterDeploymentName`, the Agent enters `unbinding-pending-user-action`, and the controller reacts by deleting the Agent CR and then the BMI. CAPI handles node drain and Node object deletion independently — the pre-terminate hook clears as soon as the Agent reaches `unbinding-pending-user-action`, so node removal does not depend on the host rebooting into discovery.
 
 The controller records the InfraEnv's UID as an annotation on the ClusterOrder (`osac.openshift.io/infraenv-uid`). If the InfraEnv is deleted and recreated, workers still in `WaitingForAgent` are marked `Failed` (stale ignition) and enter the retry pipeline rather than waiting forever for an agent that will never register with the old discovery data.
 
@@ -647,12 +668,17 @@ The controller sets the following metadata fields on the created BMI:
 - `tenant`: the cluster's tenant (see Worker Tenancy and Ownership)
 - `labels["osac.openshift.io/cluster-order"]`: `"<cluster-order-name>"` — links BMI to parent ClusterOrder
 - `annotations["osac.openshift.io/owner-reference"]`: `"ClusterOrder/<cluster-order-name>"`
+- `annotations["osac.openshift.io/cluster-api-id"]`: the authoritative Cluster API ID, a server-owned marker permitted only on the private worker Create path; public BMI Create requests supplying it are rejected with `INVALID_ARGUMENT`
+
+Before Create, fulfillment resolves the marked Cluster and verifies that the BMI tenant is exactly the Cluster tenant; the attachment uses the Cluster's stored Subnet API ID, exactly its stored SecurityGroup API IDs plus the automatic Cluster SecurityGroup, `primary: true`, and the stored `fabric_interface` of a matching instance-type node set. Caller overrides, missing or mismatched identity, tenant, networks, groups, or interface fail closed as defined by [CaaS worker authorization](/enhancements/OSAC-1436-caas-networking/design.md#caas-worker-network-authorization). The authoritative Cluster must not be deleting and the applicable network creation gates must pass. A transient dependency rejection (`FAILED_PRECONDITION`, for example the automatic SecurityGroup not READY) leaves the reserved slot without a BMI: retry with transient backoff, without entering `Failed`, consuming a failed attempt, or incrementing failure metrics. An uncertain Create outcome still follows identity recovery below, never this definite-rejection path. New creates also wait for the HostedCluster and `ManagementPublicationReady=True`; cleanup is never gated by creation prerequisites.
+
+The attachment checks and networking-resource readiness gates above apply only with provider networking enabled. With networking disabled, worker Create sends no tenant attachment; fulfillment still verifies the private Cluster marker, authoritative Cluster tenant, live Cluster and matching instance-type node set. It does not require a Subnet lease, selected fabric interface or automatic SecurityGroup readiness for that attachment-free fallback.
 
 **Idempotency on lost responses:** If `BareMetalInstances.Create` succeeds but the response or status update is lost, the controller must not create a duplicate BMI on the next reconciliation. The design guarantees this through the durable status journal plus database constraints; the exact reconciliation choreography is an implementation concern:
 
 1. **Reservation before creation (status journal):** a worker slot and its BMI name exist in `status.workers[]` before any external Create, and `bmiCreateState` distinguishes a never-attempted reservation (`Reserved`) from a Create that may have reached fulfillment (`Attempted`). An unconfirmed Create outcome is therefore always an *unknown outcome*, never treated as absence — only an authoritative `Get` returning `NotFound` (or a confirmed cleanup) releases a recorded identity.
 
-2. **Identity recovery, not re-creation:** an unconfirmed Create is recovered by owned name — a scoped List filtered by the `osac.openshift.io/cluster-order` label, with an `AlreadyExists` Create response as an additional recovery hint. A recovered BMI must pass the full ownership checks (tenant, name, owner-reference, cluster-order label) before its identity is adopted; a deleting or ambiguous candidate is rejected, and List omission alone is never proof of absence.
+2. **Identity recovery, not re-creation:** an unconfirmed Create is recovered by owned name — a scoped List filtered by the `osac.openshift.io/cluster-order` label, with an `AlreadyExists` Create response as an additional recovery hint. A recovered BMI must pass the full ownership checks (tenant, name, owner-reference, cluster-order label, authoritative `cluster-api-id` marker and any recorded BMI ID) before its identity is adopted; a deleting or ambiguous candidate is rejected, and List omission alone is never proof of absence.
 
 3. **Database uniqueness constraint (safety net):** [OSAC-3266](https://redhat.atlassian.net/browse/OSAC-3266) adds a `UNIQUE(tenant, project, name)` constraint on all resource tables including `bare_metal_instances`. If a race results in a duplicate `Create` call, the fulfillment-service returns `AlreadyExists`, which the controller handles through the same identity-recovery path.
 
@@ -695,29 +721,35 @@ This is a cross-component change affecting the fulfillment-service proto (Cluste
 
 #### Worker Tenancy and Ownership
 
-CaaS-managed BMIs are created under the **cluster's tenant**, resolved authoritatively by the controller. The controller never trusts the ClusterOrder's own annotations as an ownership source: it reads the fulfillment-service Cluster UUID from the `osac.openshift.io/clusterorder-uuid` label, fetches the authoritative Cluster via the private API, and requires that the Cluster's tenant matches the ClusterOrder's `osac.openshift.io/tenant` annotation. Any mismatch, missing label, or missing Cluster fails closed with a `WorkerOwnershipMismatch` event and no BMI mutation. The same checks are applied on every BMI read-back: tenant, reserved name, `osac.openshift.io/owner-reference` annotation, `osac.openshift.io/cluster-order` label, and — where recorded — the BMI ID must all match.
+CaaS-managed BMIs are created under the **cluster's tenant**, resolved authoritatively by the controller. The controller never trusts the ClusterOrder's own annotations as an ownership source: it reads the fulfillment-service Cluster UUID from the `osac.openshift.io/clusterorder-uuid` label, fetches the authoritative Cluster via the private API, and requires that the Cluster's tenant matches the ClusterOrder's `osac.openshift.io/tenant` annotation. Any mismatch, missing label, or missing Cluster fails closed with a `WorkerOwnershipMismatch` event and no BMI mutation. The same checks are applied on every BMI read-back: tenant, reserved name, `osac.openshift.io/owner-reference` annotation, `osac.openshift.io/cluster-order` label, server-owned `osac.openshift.io/cluster-api-id` marker, and — where recorded — the BMI ID must all match.
 
 This is semantically correct: the tenant ordered a cluster with N workers backed by bare metal, and the worker BMIs are the physical realization of that order in the tenant's scope. The BMI's Kubernetes CR receives the actual tenant and owner-reference annotations, and ownership stays traceable via the `osac.openshift.io/owner-reference` annotation linking each BMI to its parent ClusterOrder.
 
-**Visibility (requirement, revised 2026-10-14):** worker BMIs live in the tenant's scope, so a tenant listing their bare-metal instances sees the CaaS worker BMIs alongside any tenant-created ones, with the `osac.openshift.io/cluster-order` label and `osac.openshift.io/owner-reference` annotation providing the provenance link to the parent cluster. This is intentional per the revised PRD: worker instances are visible for transparency and accounting, while cluster lifecycle operations remain the management path. The controller itself never relies on visibility for safety — its ownership checks are authoritative, not cosmetic — and a tenant mutating or deleting a cluster-managed worker BMI is recovered or rejected by those same checks (the worker is re-observed, re-bound or replaced per the retry pipeline, never silently adopted).
+**Visibility (requirement, revised 2026-10-14):** worker BMIs live in the tenant's scope, so a tenant listing their bare-metal instances sees the CaaS worker BMIs alongside any tenant-created ones, with the `osac.openshift.io/cluster-order` label and `osac.openshift.io/owner-reference` annotation providing the provenance link to the parent cluster. This is intentional per the revised PRD: worker instances are visible for transparency and accounting, while cluster lifecycle operations remain the management path. The controller itself never relies on visibility for safety — its ownership checks are authoritative, not cosmetic — and permitted mutable operations are not reverted. Ownership tampering is rejected; direct deletion triggers old-Agent cleanup and replacement only if Cluster capacity is still requested.
 
-**Metering:** CaaS resource attribution is at the Cluster level, not at the BMI level. Worker count is derived from the ClusterOrder status, not from querying BMIs by tenant.
+**Permitted operations:** tenants can Update fields that the public BMI API permits as mutable (for example `spec.run_strategy`); accepted updates are returned by that API and CaaS does not revert them. Immutable provisioning-field or status updates are rejected with `INVALID_ARGUMENT`. A permitted stop or restart is not a scale-down request and does not authorize replacing an otherwise owned BMI. A tenant Delete remains subject to BMaaS dependency guards; an accepted Delete returns an empty response. CaaS replaces the worker only after authoritative absence and old-Agent cleanup if Cluster capacity is still requested. Tenant visibility or direct BMI operations never change the Cluster's requested worker count.
+
+**Metering:** the public [event-log-driven metering design](/enhancements/OSAC-5753-event-log-driven-metering/design.md#default-meters) supersedes Cluster worker-count billing. Fulfillment captures each worker BMI's own resource events and bills through `allocation` and `consumption`, with immutable owning Cluster and node-set attribution recorded at creation; worker heartbeats carry `cluster` and `node_set` dimensions. The Cluster bills only `control_plane`, not a second copy of worker usage. By default the Cluster's READY gate defers all owned worker billing during install; once it opens, eligible spans bill retroactively from each worker's own start. A Cluster that fails or is deleted before READY bills no workers, and a worker span closed before that gate opened remains unbilled. Later READY-to-PROGRESSING transitions do not close the gate. Allocation can include DELETING until physical deletion, as the successor's rules specify. These are CaaS attribution requirements, not changes to standalone BMaaS meters or metering rule policy.
 
 **Cloud Provider Admin access:** Admins debug CaaS-managed workers via the private API. Per-cluster lookups use the `osac.openshift.io/cluster-order` label; per-worker lookups use the `status.workers[].bareMetalInstance.id` references recorded on the ClusterOrder.
 
 #### MAC Address Correlation
 
-Agent-to-BMI matching uses MAC addresses scoped to the cluster's namespace and ClusterOrder. When a BMI is allocated, its status reports the allocated host's NIC MAC addresses at `status.hardware.nics[].mac` (OSAC-4203; a host may report multiple NICs, and correlation matches any). When an Agent registers, its inventory includes NIC MAC addresses at `status.inventory.interfaces[].macAddress`.
+Agent-to-BMI matching uses MAC addresses scoped to the cluster's namespace and ClusterOrder. When a BMI is allocated, its status reports the allocated host's NIC MAC addresses at `status.hardware.nics[].mac` (OSAC-4203; multiple NICs support the provider-disabled fallback, not arbitrary-NIC matching when networking is enabled). When an Agent registers, its inventory includes NIC MAC addresses at `status.inventory.interfaces[].macAddress`.
 
 The correlation algorithm requires a unique match in **both directions** before binding:
 1. **Namespace:** the Agent must be in the same namespace as the ClusterOrder's cluster
 2. **Ownership:** the candidate worker must belong to the current ClusterOrder; an already-labelled or already-bound Agent is never a MAC fallback candidate
-3. **MAC match:** at least one of the Agent's inventory MACs must match one of the BMI's host NIC MACs (case-insensitive)
+3. **Network proof:** with provider networking enabled, the inventory entry matching the selected NetworkAttachment `spec.interface.macAddress` (case-insensitive) must contain an `ipV4Addresses` CIDR whose parsed IPv4 address equals the accepted BMI attachment-status lease for the requested `subnetRef`. An address on a different NIC or the provisioning network is insufficient. With provider networking disabled, at least one inventory MAC must match a BMI host NIC MAC case-insensitively; no selected-port lease or OSAC DNS proof is required.
 4. **Uniqueness:** exactly one unbound Agent may match a waiting worker, and that Agent may be the unique candidate for exactly one worker — one Agent matching several workers and several Agents matching one worker are both ambiguous and bind nothing
 
-If zero candidates match, the controller continues watching. If multiple candidates match, the controller logs the ambiguity and does not bind. If no match is found within the registration timeout (30 minutes, measured from the durable per-attempt `attemptStartedAt` origin), the controller sets the worker phase to `Failed` with reason `AgentRegistrationTimeout`. Incompatible candidates (an Agent already claimed by another cluster or worker) are surfaced as observable errors, not silently skipped.
+**Binding prerequisites:** approval, `clusterDeploymentName`, and NodePool-selection labels wait for BMI phase `Ready` and `ManagementPublicationReady=True`. With provider networking enabled, the `publish_public_dns_api` entry must also be `Succeeded` (both `api` and `api-int` published). A provisioning-network Agent waits, without approval or labels, while the gate is rechecked on Agent, BMI, NetworkAttachment, and ClusterOrder changes. The hub BMI CR is located by `osac.openshift.io/baremetalinstance-uuid: <status.workers[].bareMetalInstance.id>`.
 
-After the first successful MAC match, the controller labels the Agent with `osac.openshift.io/worker-name` pointing to the worker slot's opaque name. Subsequent reconciliations, readiness decisions and scale-down lookups use only this established label — MAC correlation is never re-run for an established association — the same pattern CAPA uses with the `agentMachineRef` label. Agent identity is the Kubernetes UID (a recreated same-name Agent is a different incarnation), and a binding already rewritten by HyperShift's CAP-Agent handoff for the same worker is recognized and left untouched.
+**Registration clock:** `AgentRegistrationTimeout` defaults to 30 minutes. Its origin is the latest of the BMI `NetworkHandoffComplete=True` transition, the latest `ManagementPublicationReady=True` transition, and, with provider networking enabled, `status.apiRecordsPublishedTime`. With provider networking disabled use `ProvisionTemplateComplete=True` instead of handoff and omit the OSAC DNS timestamp. Before network-ready evidence exists CaaS waits, not times out; a BMI still Progressing before handoff is not a registration failure. Suppress timeout while management publication is False or unknown, or required API records are unpublished. Once the origin is known, a missing lease or an Agent that never passes the gate expires at origin plus timeout. Reconstruct this deadline from persisted condition transitions and publication timestamps after restart; do not start a new clock from reconcile time or `attemptStartedAt`. That field remains durable attempt accounting. A later publication-ready transition supplies a new origin. Missing evidence is pending, never invented from an unrelated timestamp.
+
+If zero candidates match, the controller continues watching until that deadline; multiple candidates remain unbound with an ambiguity diagnostic. At expiry the worker becomes `Failed`, reason `AgentRegistrationTimeout`. Incompatible candidates already claimed by another cluster or worker are observable errors, not silently adopted.
+
+After the first unique match and all binding prerequisites pass, the controller persists the Agent name/UID in the worker journal, then labels the Agent with `osac.openshift.io/worker-name` pointing to the worker slot's opaque name. Subsequent reconciliations, readiness decisions and scale-down lookups use this established label together with the recorded UID — MAC correlation is never re-run for an established association — the same pattern CAPA uses with the `agentMachineRef` label. A recreated same-name Agent is a different incarnation: a UID mismatch blocks mutation and is reported, never silently adopted or deleted as the old Agent. A binding already rewritten by HyperShift's CAP-Agent handoff for the same worker is recognized and left untouched.
 
 #### Network Attachment Enrichment
 
@@ -743,9 +775,11 @@ This enrichment is a read-only consumer of the ClusterOrder's singular
 field shape. The field uses the cluster-specific `ClusterNetworkAttachment`
 type, not ComputeInstance's `ComputeNetworkAttachment`. This design requires
 the field to be present on the ClusterOrder CRD before the BM controller can
-read it.
+read it when provider networking is enabled. With networking disabled it sends
+no tenant network attachment and uses the MAC-only fallback; private Cluster
+identity and tenant checks still apply.
 
-The `interface` field is resolved once during cluster fulfillment from `BareMetalInstanceType.network_ports[]`, stored as the node set's immutable `fabric_interface` — on the proto `ClusterNodeSet` and mirrored to the ClusterOrder's `nodeRequests[].fabricInterface` — and consumed by the worker controller when building the BMI request. Different node sets may therefore carry different stored interface values, and later profile changes do not alter an in-flight ClusterOrder. The stored `fabricInterface` has a second consumer: IP-discovery feedback filters the Agent's inventory interfaces by that NIC name, so the provisioning interface's address is not reported as the worker's tenant-network address.
+The `interface` field is resolved once during cluster fulfillment from `BareMetalInstanceType.network_ports[]`, stored as the node set's immutable `fabric_interface` — on the proto `ClusterNodeSet` and mirrored to the ClusterOrder's `nodeRequests[].fabricInterface` — and consumed by the worker controller when building the BMI request. Different node sets may carry different stored values; later profile changes do not alter an in-flight ClusterOrder. For Agent proof, use the selected NetworkAttachment port's MAC and accepted BMI IPv4 lease, not equality between an instance-type port name and a guest NIC name.
 
 #### Minimum MCE Version
 
@@ -778,15 +812,17 @@ Each stage is idempotent. The controller re-enters from the top on each reconcil
 
 The reconciler adds its own finalizer (`osac.openshift.io/baremetalworker-finalizer`) and, on ClusterOrder deletion, actively deletes every recorded worker BMI via `BareMetalInstances.Delete` before releasing it (see Cluster Deletion).
 
-**State rebuild on restart:** Worker lifecycle state (`phase`, `attemptCount`, failure details) is persisted in `ClusterOrder.status.workers[]` and survives controller restarts. On restart, the controller re-derives each worker's phase from live BMI and Agent state to detect changes that occurred while the controller was down — e.g., a BMI that transitioned to `Running` or an Agent that registered. For each entry in `status.workers[]` with `kind: BareMetalInstance`, the controller: (1) looks up the BMI via the private API using the recorded ID (or recovers it by owned name for ID-less reservations), (2) reads the BMI's NIC MACs from status, (3) lists Agents in the cluster namespace and matches by the established worker-name label or MAC, (4) updates the phase if live state has progressed — e.g., BMI with identity and no matching Agent → `WaitingForAgent`; BMI with bound Agent in NodePool → `Ready`; BMI authoritatively gone → stale entry, remove. The `attemptCount` and failure history are preserved from the persisted status, not re-derived.
+**State rebuild on restart:** Worker lifecycle state (`phase`, `attemptCount`, failure details) persists in `ClusterOrder.status.workers[]`. The controller reads each BMI by recorded ID (or recovers an ID-less reservation by owned name), validates ownership, and observes Agents by established worker-name association or the initial correlation gate. Preserve recorded `Failed`, `Unbinding` and `Deleting` intent before projecting active provisioning phases: an active provisioning slot with BMI identity but without a bound Agent stays `WaitingForAgent`; neither identity alone nor a premature Agent binding proves Ready. Reconstruct the registration deadline from persisted network/publication evidence, preserving attempt counts and history.
+
+**Tenant-deleted Ready BMI:** observation of DELETING or authoritative `NotFound` for a previously Ready worker explicitly triggers retirement of its established Agent incarnation, even without an Agent-unbind watch event. Persist that cleanup intent, request unbinding through the existing HyperShift/CAPI Agent lifecycle, wait for the old association to be unbound, then delete the old Agent with UID/resourceVersion preconditions and confirm its absence. A same-name Agent with a new UID is not the old incarnation. Retain the slot and BMI identity through pending or dependency-blocked cleanup; clear the old identity only after authoritative BMI `NotFound` and old-Agent absence. If capacity is still requested and the Cluster is live, the slot then enters the replacement pipeline; otherwise remove it. Never bind a replacement while the old Agent remains, treat a transient lookup error as absence, or infer scale-down from direct BMI deletion. This desired lifecycle rule also applies when discovery occurs during restart.
 
 ### Security Considerations
 
-CaaS-managed BMIs are created under the cluster's tenant via the private API, and the controller verifies ownership authoritatively on every reconciliation (see Worker Tenancy and Ownership): the fulfillment-service Cluster must exist, its tenant must match the ClusterOrder's tenant annotation, and every BMI read-back must match the recorded tenant, name, owner-reference and cluster-order label. The private API bypasses tenant-scoped OPA policies because it operates with system-level credentials. Ownership is traceable via the `osac.openshift.io/owner-reference` annotation linking each BMI to its parent ClusterOrder.
+CaaS-managed BMIs are created under the cluster's tenant via the private API, and the controller verifies ownership authoritatively on every reconciliation (see Worker Tenancy and Ownership): the fulfillment-service Cluster must exist, its tenant must match the ClusterOrder's tenant annotation, and every BMI read-back must match the recorded tenant, name, owner-reference, cluster-order label and server-owned Cluster API ID marker. The private API bypasses tenant-scoped OPA policies because it operates with system-level credentials. Ownership is traceable via the `osac.openshift.io/owner-reference` annotation linking each BMI to its parent ClusterOrder.
 
-The discovery ignition contains the InfraEnv's pull secret and the assisted-service endpoint URL. It is passed inline as `user_data` on each BMI (max 64KB; PoC measured 15KB). The `user_data` field is immutable (enforced by the proto `IMMUTABLE` field behavior annotation). The InfraEnv uses late binding (no `clusterRef`) — agents register as unbound and are explicitly bound by the controller after MAC correlation. Agent-to-cluster isolation is enforced by the MAC correlation scoping, not by the ignition content.
+The discovery ignition contains the InfraEnv's pull secret and the assisted-service endpoint URL. It is passed inline as `user_data` on each BMI (max 64KB; PoC measured 15KB). The `user_data` field is immutable (enforced by the proto `IMMUTABLE` field behavior annotation). The InfraEnv uses late binding (no `clusterRef`) — agents register as unbound and bind only after unique correlation and the networking-aware gate. Agent-to-cluster isolation is enforced by the MAC correlation scoping, not by the ignition content.
 
-No changes to authentication or authorization flows are required. The existing OPA policies enforce tenant isolation for all public API access. The osac-operator authenticates to the private API using a token file mounted from a Kubernetes Secret (`OSAC_FULFILLMENT_TOKEN_FILE`), following the same pattern used by the existing feedback controllers for Signal RPCs.
+Authentication credentials and the public OPA tenancy policy are unchanged; the private worker Create path adds the Cluster-specific authorization checks above and rejects the server-owned marker on public Create. The osac-operator authenticates to the private API using a token file mounted from a Kubernetes Secret (`OSAC_FULFILLMENT_TOKEN_FILE`), following the same pattern used by the existing feedback controllers for Signal RPCs.
 
 Tenants interact only through the fulfillment-service API. They do not have K8s API access to the hub cluster — ClusterOrder, InfraEnv, and Agent CRs are not tenant-readable. The `Workers` references in ClusterOrder status are visible only to platform operators with hub cluster access.
 
@@ -800,9 +836,13 @@ The private API token (`OSAC_FULFILLMENT_TOKEN_FILE`) authenticates as `service-
 |---|---|---|---|
 | InfraEnv creation fails | Controller retries on next reconciliation cycle (controller-runtime requeue) | Automatic retry with exponential backoff | Cluster stuck in `PROGRESSING` with `WORKER_PROVISIONING_BLOCKED` condition |
 | InfraEnv ignition not generated | Controller polls InfraEnv status with 30s requeue | Automatic; investigate assisted-service if persistent | Same as above |
-| BMI creation fails (private API error) | Worker phase set to `Failed`, `attemptCount` incremented | Controller deletes the failed BMI and retries with escalating backoff (capped at 5m). Retries indefinitely | Cluster shows `WORKER_PROVISIONING_FAILED` with attempt count |
+| BMI creation fails definitively (excluding transient dependency rejection) | Worker phase set to `Failed`; account for the failed attempt once | Recover any recorded identity and clean it up before retrying with reason-classified backoff. An uncertain outcome uses identity recovery, not this failure path | Cluster shows `WORKER_PROVISIONING_FAILED` with tenant-safe feedback |
 | BMI provisioning fails (host allocation or backend error) | BMI enters `Failed` phase, worker phase set to `Failed` | Controller deletes the failed BMI and retries with escalating backoff. Each attempt allocates a fresh host | Cluster shows degraded worker count during retries |
-| Agent does not register within timeout | Worker phase set to `Failed`, reason `AgentRegistrationTimeout` | Controller deletes the timed-out BMI and retries with escalating backoff (capped at 30m) | Cluster shows `WORKER_PROVISIONING_FAILED` |
+| No Agent passes the binding gate by the registration deadline | Worker phase set to `Failed`, reason `AgentRegistrationTimeout` | Controller deletes the timed-out BMI and retries with escalating backoff (capped at 30m) | Cluster shows `WORKER_PROVISIONING_FAILED` |
+| BMI network attachment, handoff or IP discovery fails | Preserve `NetworkAttachmentFailed`, `NetworkHandoffFailed` or `IPDiscoveryFailed`; worker Failed | Clean the old Agent/BMI before replacement with long backoff | Fixed networking messages; administrator details stay on the hub |
+| Worker Create dependency is not READY | Reserved slot has no BMI; no failed attempt | Retry transiently, retain unknown-outcome recovery for uncertain Create | Worker provisioning waits |
+| Worker Delete blocked by a manual attachment or FabricDomain | Retain slot, BMI identity and finalizer; no replacement | Retry after the dependency owner removes it; await authoritative NotFound and Agent cleanup | Capacity removal or Cluster deletion remains pending |
+| Tenant deletes a Ready worker BMI | Explicitly trigger unbind/delete of the established old Agent | Confirm BMI NotFound and old-Agent absence before replacement if capacity is still requested | Worker replaced, not a scale-down |
 | MAC correlation finds no match | Agent remains uncorrelated | Controller logs a warning and continues watching. If all BMIs are correlated and extra agents exist, they are ignored | No direct tenant impact |
 | Agent binding to NodePool fails | Agent not installed as worker | assisted-service reports failure in Agent conditions; controller reflects in worker phase | Cluster shows degraded worker count |
 | Scale-down: Agent unbinding times out | Agent stuck in unbound state longer than 30 minutes | Worker remains in `Unbinding` phase with `lastFailureReason: AgentUnbindingTimeout`. Controller retries periodically. Manual intervention required. No replacement is triggered | Node count mismatch visible in Cluster status |
@@ -845,7 +885,7 @@ Tenant-owned BMaaS workflows are unaffected. A tenant creating their own BareMet
 | Worker created | Normal | `WorkerCreated` | Controller creates a worker resource via private API |
 | Agent correlated | Normal | `AgentCorrelated` | MAC match found between Agent and worker resource |
 | Worker joined | Normal | `WorkerReady` | Worker installed as cluster node |
-| Agent registration timeout | Warning | `AgentRegistrationTimeout` | No Agent registered within the timeout window |
+| Agent registration timeout | Warning | `AgentRegistrationTimeout` | No Agent passed the networking-aware binding gate before its reconstructed deadline |
 | Worker provisioning failed | Warning | `WorkerFailed` | Worker resource entered `Failed` phase (with attempt number and retry interval) |
 | Worker retry | Normal | `WorkerRetry` | Replacement BMI created for a failed worker |
 | Worker deleted / scale-down | Normal | `WorkerDeleted` | Worker slot marked for unbinding during scale-down |
@@ -859,7 +899,7 @@ Tenant-owned BMaaS workflows are unaffected. A tenant creating their own BareMet
 | Risk | Impact | Mitigation |
 |---|---|---|
 | RHCOS DiskImage not linked to ClusterVersion | Controller cannot resolve boot image; BMI creation blocked with `RHCOSImageNotFound` condition | Cloud Infrastructure Admin must register DiskImages and link them to ClusterVersions via `--disk-image` before enabling CaaS provisioning. Reference validation catches this at ClusterVersion creation time. |
-| Tenant mutation/deletion of cluster-managed worker BMIs (visible in the tenant's scope per the revised PRD) | Tenants can see and modify worker BMIs in `osac get/list baremetalinstances` | Controller ownership checks fail closed on tampering: mismatched identities are rejected or recovered (re-bound, or replaced via the retry pipeline), never silently adopted. Cluster lifecycle remains the supported management path. |
+| Tenant mutation/deletion of cluster-managed worker BMIs (visible in the tenant's scope per the revised PRD) | Tenants can see and modify worker BMIs in `osac get/list baremetalinstances` | Accepted mutable updates are not reverted or inferred as scale-down. Ownership tampering fails closed; direct deletion requires authoritative BMI absence and old-Agent cleanup before replacement. Cluster capacity changes remain the supported scale-down path. |
 | BMaaS deprovision failure leaves hosts in limbo during scale-down | Hosts are not cleaned up; potential data leakage if reassigned | Worker remains in `Unbinding`/`Deleting` phase with error details in `lastFailureReason`. Operators alerted via the `osac_caas_worker_provisioning_failures_total` rate and desired-ready gap. Manual intervention documented in support procedures. |
 | Discovery ignition exceeds `user_data` limit (64KB) | BMI creation rejected | PoC measured 15KB. The controller emits a `DiscoveryIgnitionSizeWarning` event when the fetched ignition exceeds 48KB (75% of the 64KB limit), giving operators advance notice before BMI creation starts failing. |
 | Concurrent scale operations on multiple clusters exhaust host inventory | Multiple ClusterOrders compete for limited hosts; some fail | BMI creation fails, worker enters `Failed` phase with `ResourceExhausted`-class backoff. ClusterOrder status reflects partial provisioning. Inventory sizing is the admin's responsibility. |
@@ -868,7 +908,7 @@ Tenant-owned BMaaS workflows are unaffected. A tenant creating their own BareMet
 
 This design tightly couples the osac-operator to the fulfillment-service private API for BMI lifecycle management. The controller becomes a gRPC client of the fulfillment-service, adding a synchronous dependency in the reconciliation path. If the fulfillment-service is unavailable, worker provisioning and deprovisioning stall. The alternative — creating BMI CRs directly on the hub cluster — would avoid this dependency but lose the audit trail and tenant-scoped ownership records that the fulfillment-service provides. The coupling is justified because the private API is the canonical path for all BMI operations, and the fulfillment-service is a core dependency that the osac-operator already communicates with for Signal RPCs and other operations.
 
-The per-cluster InfraEnv provides pull secret isolation. Late binding (no `clusterRef`) means agents register as unbound and the controller explicitly binds them after MAC correlation. MAC-based correlation is needed both for Agent-to-BMI mapping (scale-down cleanup, failure tracking) and for cluster binding (`clusterDeploymentName` setting).
+The per-cluster InfraEnv provides pull secret isolation. Late binding (no `clusterRef`) means agents register as unbound and the controller binds them only after unique correlation and the networking-aware gate. Established worker-name/UID associations drive subsequent cleanup; MAC fallback does not replace the selected-port lease proof for initial binding.
 
 ## Alternatives (Not Implemented)
 
@@ -891,22 +931,28 @@ Replace the controller-based flow with a new AAP role that calls the private API
 
 ### Unit Tests
 
-- BareMetalWorkerReconciler: worker capacity planning reserves the correct number of slots when desired count exceeds current count, and re-reconciles after a lost Create acknowledgement without creating duplicates (recovery by owned name / `AlreadyExists`).
+- BareMetalWorkerReconciler: worker capacity planning reserves the correct number of slots when desired count exceeds current count, and re-reconciles after a lost Create acknowledgement without creating duplicates (recovery by owned name / `AlreadyExists`). Identity-less, failed/retrying and teardown slots retain their obligations even when excluded from `currentWorkers`; no fresh slot bypasses pending cleanup.
 - BareMetalWorkerReconciler: scale-down marks excess slots `Unbinding` by deletion priority (Failed → not-yet-bound → newest Ready) and teardown calls `BareMetalInstances.Delete` for the recorded IDs.
-- BareMetalWorkerReconciler: MAC correlation matches an unbound Agent to a waiting worker only on a unique bidirectional match; Agents from a different namespace, already-labelled Agents, and ambiguous matches never bind.
+- BareMetalWorkerReconciler: initial correlation requires a unique bidirectional match and BMI Ready/management gates. Test selected-port MAC plus parsed accepted IPv4 lease with networking enabled, reject another NIC/provisioning address, wait for both API records, and use scoped host-MAC fallback without networking. Wrong namespaces, already-claimed Agents and ambiguous matches never bind.
 - BareMetalWorkerReconciler: InfraEnv creation uses late binding (no `clusterRef`), correct owner reference, and a controller-owned pull-secret Secret; stale-UID classification marks waiting workers `Failed` after InfraEnv recreation.
 - BareMetalWorkerReconciler: worker phase transitions correctly through `Provisioning` → `WaitingForAgent` → `Binding` → `Ready`.
-- BareMetalWorkerReconciler: worker phase transitions to `Failed` after the agent registration timeout measured from the durable per-attempt `attemptStartedAt` origin.
+- BareMetalWorkerReconciler: registration waiting enters `Failed` for timeout only when the networking-aware registration deadline expires; reconstruct from persisted network/management/DNS evidence after restart, suppress before handoff or missing publication, and keep `attemptStartedAt` solely for attempt accounting. Explicit BMI/Agent failures and stale ignition retain their separately defined failure paths.
 - BareMetalWorkerReconciler: reconciliation is idempotent — re-running with the same state produces no new API calls; a lost Create acknowledgement keeps the reservation and recovers by owned name / `AlreadyExists`.
-- Tenant safety: the controller fails closed when the authoritative Cluster tenant does not match the ClusterOrder tenant annotation, and when a BMI read-back violates the ownership contract (tenant, name, owner-reference, cluster-order label, recorded ID).
+- Tenant safety: the controller fails closed when the authoritative Cluster tenant does not match the ClusterOrder tenant annotation, and when a BMI read-back violates the ownership contract (tenant, name, owner-reference, cluster-order label, server-owned Cluster API ID marker, recorded ID).
+- Private authorization: reject a public Create carrying `cluster-api-id`; verify authoritative Cluster tenant, Subnet, exact tenant plus automatic SecurityGroups, stored node-set interface and instance type. Dependency `FAILED_PRECONDITION` creates no Failed phase, failed attempt or failure metric; unknown outcomes recover the original identity.
+- Networking failures: each stable reason selects long backoff and the fixed tenant feedback; verify `WorkerNetworkingReady` for missing/Ready/failed BMIs, failed SecurityGroups, zero workers and provider-disabled mode.
+- Cleanup: rejected Delete, successful Delete without NotFound, cache/List absence, lookup errors and ID-less recovery retain identity. Persist Agent name/UID before binding and retain it on restart; pruned/conflicting writes authorize no side effects. Old-Agent cleanup is required on tenant deletion of a Ready BMI, including restart and new-UID same-name Agent cases; a UID mismatch authorizes neither adoption nor deletion, and no replacement precedes confirmed cleanup.
 - RBAC: osac-operator's ClusterRole includes `get`, `list`, `watch`, `patch`, and `delete` on `agents` in the `agent-install.openshift.io` API group (kubebuilder markers).
 
 ### Integration Tests (envtest)
 
 - Create a ClusterOrder with bare-metal node requests against a real API server. Verify InfraEnv CR is created with correct spec. Verify BMI creation calls reach the (faked) private API. Verify ClusterOrder status reflects `workers` entries, aggregates and conditions.
-- Simulate Agent registration by creating Agent CRs with matching MAC addresses. Verify correlation, `clusterDeploymentName` binding, `approved: true`, and labeling.
+- Simulate provisioning-network Agent arrival, BMI handoff/Ready, selected-MAC lease and API publication independently. Verify no approval, binding or NodePool labels before all gates pass, then verify correlation and selection; repeat with provider networking disabled and management publication still required.
 - Simulate scale-down by decreasing `nodeRequests`. Verify retirement intent persists before cleanup, Agent CRs are deleted with UID preconditions, and BMI delete is called for the excess workers.
 - Verify ClusterOrder deletion cleans up all BMIs and the InfraEnv before removing the `baremetalworker` finalizer, including recovery of ID-less reservations.
+- Block BMI deletion with a manual attachment or FabricDomain, then remove the dependency. Verify BMF-owned cleanup completes and authoritative NotFound, not Delete acknowledgment, releases identity and finalizers.
+- Delete a Ready BMI without delivering an Agent-unbind event, restart during `Unbinding` and `Deleting`, and verify persisted cleanup intent and explicit old-Agent unbind/delete before replacement; decreasing Cluster capacity instead removes the slot without replacement. An uncertain Create response or observation error never manufactures a failed attempt.
+- Verify worker event attribution is immutable and tenant-scoped. Under the public metering successor, the Cluster gate defers worker allocation/consumption until READY; pre-READY Cluster failure/deletion and closed worker spans bill nothing, while eligible active spans bill retroactively without duplicate Cluster worker-count charges.
 
 ### E2E Tests
 
@@ -914,7 +960,7 @@ Replace the controller-based flow with a new AAP role that calls the private API
 - Scale-up: increase node count on an existing cluster. Verify new workers are provisioned and join.
 - Scale-down: decrease node count. Verify workers are drained, Agent CRs deleted, BMIs deleted.
 - Cluster deletion: delete a cluster with bare-metal workers. Verify all BMIs are cleaned up.
-- Tenancy: verify worker BMIs are created in the cluster's tenant and remain correlated to the ClusterOrder; verify tenants can list their cluster's worker BMIs with the cluster-order provenance labels, and that tenant mutation/deletion of a worker BMI is recovered or rejected rather than silently adopted.
+- Tenancy: verify worker BMIs are created in the cluster's tenant and remain correlated to the ClusterOrder; verify tenants can list their cluster's worker BMIs with the cluster-order provenance labels, that permitted mutable updates remain accepted without reverting or replacing the BMI, and that direct Delete is guarded and triggers old-Agent cleanup/replacement, not scale-down.
 - Pool removal: verify no BareMetalPool CRs are created during CaaS cluster provisioning. Verify the `cluster_infra` AAP step no longer references BareMetalPool.
 
 Note: full E2E tests require a BMaaS-capable test environment with physical or simulated bare-metal hosts. Initial E2E coverage may be limited to API-level verification with mocked BMaaS responses.
@@ -939,11 +985,11 @@ Downgrade requires:
 3. Re-deploy the `cluster_infra` AAP step and scheduled `osac-import-agents` job for BareMetalPool management.
 4. Revert the osac-operator to the previous version.
 
-The ClusterOrder CRD gains a new status field (`workers`). On downgrade, the older controller ignores this field. No data migration is needed because the field is status-only (the controller rebuilds it from live state on startup).
+The ClusterOrder CRD gains a durable status journal (`workers`). Preserve its recorded BMI and Agent identities and cleanup intent until teardown is confirmed; live-state reconstruction is not a substitute for a lost journal. Downgrade only after worker cleanup completes, and do not install a CRD that prunes the journal while it still authorizes pending actions.
 
 ## Version Skew Strategy
 
-The osac-operator (controller) and fulfillment-service (private API) must be upgraded together or the operator first. The controller calls `BareMetalInstances.Create` with fields introduced by the DiskImage integration (OSAC-1270 — `spec.disk_image`) and the instance type reference (OSAC-1201 — `spec.instance_type`), both listed dependencies — the fulfillment-service must have them implemented before CaaS bare-metal provisioning is enabled, so there is no version skew scenario for these fields. The optional `WorkerStatus` fields (`attemptStartedAt`, `bmiCreateState`, `readySince`) are unknown to older CRDs; the controller verifies that a write survived (an older CRD may prune the field) before treating it as authorization for an external Create.
+The osac-operator (controller) and fulfillment-service (private API) must be upgraded together or the operator first. The controller calls `BareMetalInstances.Create` with fields introduced by the DiskImage integration (OSAC-1270 — `spec.disk_image`) and the instance type reference (OSAC-1201 — `spec.instance_type`), both listed dependencies — the fulfillment-service must have them implemented before CaaS bare-metal provisioning is enabled, so there is no version skew scenario for these fields. The optional `WorkerStatus` fields (`attemptStartedAt`, `bmiCreateState`, `readySince`, `agent`) are unknown to older CRDs; the controller verifies that required journal writes survived (an older CRD may prune fields) before treating them as authorization for external Create or Agent binding/cleanup.
 
 CaaS-managed BMIs belong to the cluster's tenant, so no fulfillment-service tenancy change is involved. Worker CRs use the configured Hub namespace, not a per-tenant namespace; enforcing same-Hub placement across multiple Hubs remains a separate rollout gate.
 
@@ -957,7 +1003,7 @@ CaaS-managed BMIs belong to the cluster's tenant, so no fulfillment-service tena
 
 **Disabling the feature:**
 - Remove bare-metal node sets from the cluster catalog items. Existing clusters with bare-metal workers continue running — the controller does not deprovision workers unless instructed (scale-down or delete).
-- To force-remove CaaS BMIs: delete them via the private API. The controller removes `status.workers[]` entries automatically once the BMI is authoritatively gone (a `Get` returning `NotFound`; a successful Delete alone is still pending). If entries are stuck, patch the ClusterOrder status to remove them manually. Hosts must be manually cleaned if BMaaS deprovision failed.
+- To remove CaaS BMIs: use the private API subject to the same dependency guards. Delete acknowledgment remains pending; retain the journal until authoritative BMI NotFound and old-Agent cleanup. Direct Ready BMI deletion triggers explicit Agent unbind/delete and replacement if capacity remains requested; use Cluster scale-down to reduce capacity. Remove blocking dependencies through their owning APIs, repair BMF cleanup, and let reconciliation finish. Never erase the journal or bypass finalizers to manufacture absence.
 
 **Recovery:**
 - The controller is designed for idempotent reconciliation. Restarting the osac-operator pod causes the controller to rebuild state from the ClusterOrder status, re-query BMI and Agent CRs, and resume any pending operations. No manual consistency repair is needed.
